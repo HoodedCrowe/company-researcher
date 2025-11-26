@@ -2,7 +2,6 @@
 
 import json
 import os
-from datetime import datetime
 
 from anthropic import Anthropic
 
@@ -12,8 +11,8 @@ from models.schemas import (
     Briefing,
     CompanyFact,
     PlannerOutput,
-    SearchQuery,
 )
+from agent.prompts import EXTRACTION_PROMPT, PLANNER_PROMPT, SYNTHESIS_PROMPT
 from search.tavily import SearchError, TavilySearch
 from utils.output import (
     print_facts_summary,
@@ -43,39 +42,14 @@ def planner_node(state: AgentState) -> dict:
     - Provide reasoning for research approach
     """
     print_header(f"Planning research for: {state.company_name_raw}", "🤔")
-    
+
     client = get_anthropic_client()
-    
-    prompt = f"""You are a company research planner. Given a company name, you need to:
-1. Interpret/disambiguate it (e.g., "Apple" might mean "Apple Inc, the technology company" to avoid confusion with fruit)
-2. Generate up to {Config.MAX_SEARCH_QUERIES} search queries to find comprehensive information
 
-Target these information categories:
-- Company overview (founding, headquarters, description)
-- Funding and valuation (recent rounds, investors)
-- Products and services
-- Leadership team (CEO, founders, key executives)
-- Employee headcount
-- Recent news and developments
-
-IMPORTANT: Prioritize queries that will find results on authoritative sites like:
-{', '.join(Config.PRIORITY_DOMAINS)}
-
-For your first 1-2 queries, explicitly include site names like "Crunchbase" or "LinkedIn" to quickly find authoritative data.
-
-Company to research: "{state.company_name_raw}"
-
-Respond with valid JSON matching this exact structure:
-{{
-    "company_interpreted": "Full formal company name",
-    "disambiguation_note": "Brief context to add to searches (e.g., 'technology company' or 'fintech startup')",
-    "reasoning": "Your overall research strategy explanation",
-    "queries": [
-        {{"query": "search query text", "reasoning": "why this query", "priority": true/false}}
-    ]
-}}
-
-Set priority=true for queries targeting authoritative sites. Generate exactly {Config.MAX_SEARCH_QUERIES} queries."""
+    prompt = PLANNER_PROMPT.format(
+        max_queries=Config.MAX_SEARCH_QUERIES,
+        priority_domains=', '.join(Config.PRIORITY_DOMAINS),
+        company_name=state.company_name_raw
+    )
 
     response = client.messages.create(
         model=Config.ANTHROPIC_MODEL,
@@ -148,7 +122,7 @@ def researcher_node(state: AgentState) -> dict:
                 results = search_client.search(query.query)
                 all_results.extend(results)
                 print_search_result(query.query, len(results), success=True, retry=True)
-            except SearchError as e:
+            except SearchError:
                 failed_queries.append(query.query)
                 warnings.append(f"Search failed for: {query.query}")
                 print_search_result(query.query, 0, success=False)
@@ -196,30 +170,11 @@ def researcher_node(state: AgentState) -> dict:
         f"Source [{unique_sources.index(r.url) + 1}]: {r.url}\nTitle: {r.title}\nContent: {r.snippet}"
         for r in all_results if r.url in unique_sources
     ])
-    
-    extraction_prompt = f"""Extract key facts about {state.company_name_interpreted} from these search results.
 
-{results_text}
-
-Extract facts in these categories:
-- overview: Company description, founding date, headquarters, industry
-- funding: Funding rounds, valuation, investors
-- products: Main products, services, what they do
-- leadership: CEO, founders, key executives
-- headcount: Number of employees
-- news: Recent developments, announcements, news
-
-Respond with valid JSON array of facts:
-[
-    {{"category": "overview", "fact": "factual statement", "source_url": "url", "source_index": 1}},
-    ...
-]
-
-Rules:
-- Only include facts clearly stated in the sources
-- source_index should match the [N] reference number
-- Be concise but informative
-- Include at least 1 fact per category if available"""
+    extraction_prompt = EXTRACTION_PROMPT.format(
+        company_name=state.company_name_interpreted,
+        results_text=results_text
+    )
 
     response = client.messages.create(
         model=Config.ANTHROPIC_MODEL,
@@ -288,27 +243,16 @@ def synthesizer_node(state: AgentState) -> dict:
         f"- [{f.category}] {f.fact} (source: [{f.source_index}])"
         for f in state.facts
     ])
-    
+
     sources_text = "\n".join([
         f"[{i}] {url}" for i, url in enumerate(state.sources, 1)
     ])
-    
-    synthesis_prompt = f"""Write an executive briefing for {state.company_name_interpreted}.
 
-Available facts:
-{facts_text}
-
-Sources:
-{sources_text}
-
-Write 2-3 paragraphs that:
-1. Provide a clear overview of the company
-2. Highlight key business information (products, funding, size)
-3. Note any recent developments or news
-
-Include inline citations using [N] format referring to the source numbers.
-Be concise, professional, and informative.
-Write in a neutral, factual tone suitable for business research."""
+    synthesis_prompt = SYNTHESIS_PROMPT.format(
+        company_name=state.company_name_interpreted,
+        facts_text=facts_text,
+        sources_text=sources_text
+    )
 
     response = client.messages.create(
         model=Config.ANTHROPIC_MODEL,
